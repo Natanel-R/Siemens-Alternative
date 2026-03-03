@@ -102,6 +102,11 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.processButton.clicked.connect(self.onProcessButton)
         self.layout.addWidget(self.processButton)
 
+        self.loadSavedButton = qt.QPushButton("Load Saved Patient Analysis")
+        self.loadSavedButton.setStyleSheet("font-weight: bold; height: 35px; background-color: #8e44ad; color: white; margin-bottom: 20px;")
+        self.loadSavedButton.clicked.connect(self.onLoadSavedButton)
+        self.layout.addWidget(self.loadSavedButton)
+
         # --- 4. FLAT TUMOR MARKING (Just the Tools) ---
         self.segmentEditorWidget = slicer.qMRMLSegmentEditorWidget()
         self.segmentEditorWidget.setMRMLScene(slicer.mrmlScene)
@@ -177,6 +182,48 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         except Exception as e:
             slicer.util.errorDisplay(f"Load failed: {e}")
 
+    def onLoadSavedButton(self):
+        import os
+        print("\033[H\033[J", end="") 
+        try:
+            path = self.inputDirSelector.currentPath
+            if not path:
+                slicer.util.errorDisplay("Please select a patient directory first!")
+                return
+            
+            mask_path = os.path.join(path, "Analysis_Results", "tumor_mask.seg.nrrd")
+            
+            if not os.path.exists(mask_path):
+                slicer.util.errorDisplay("No saved analysis found in this folder.\n(Could not find tumor_mask.seg.nrrd)")
+                return
+
+            self.resultsTextBox.setPlainText("Loading saved patient data...")
+            slicer.app.processEvents()
+
+            # 1. Clear memory and load the raw MRI scans
+            slicer.mrmlScene.Clear()
+            self.logic.load_dce_data(path)
+            slicer.app.processEvents()
+
+            # 2. Load the saved mask and rename it so our math engine recognizes it
+            seg_node = slicer.util.loadSegmentation(mask_path)
+            seg_node.SetName("My_Tumor_Drawings")
+
+            # 3. Re-link the UI so they can edit the mask if they want to
+            mri_node = slicer.mrmlScene.GetFirstNodeByName("10: B0")
+            if mri_node:
+                self.segmentEditorWidget.setMRMLScene(slicer.mrmlScene)
+                editorNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentEditorNode")
+                self.segmentEditorWidget.setMRMLSegmentEditorNode(editorNode)
+                self.segmentEditorWidget.setSegmentationNode(seg_node)
+                self.segmentEditorWidget.setSourceVolumeNode(mri_node)
+
+            # 4. Automatically trigger the math engine and open the dashboard!
+            self.onAnalyzeButton()
+            
+        except Exception as e:
+            slicer.util.errorDisplay(f"Failed to load saved data: {e}")
+
     def onAnalyzeButton(self):
         print("\033[H\033[J", end="")
         try:
@@ -190,13 +237,13 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             # --- THE FLOATING DASHBOARD ---
             self.dashboardWindow = qt.QDialog()
-            self.dashboardWindow.setWindowTitle("DCE Kinetics & 1st Order Statistics")
-            self.dashboardWindow.resize(800, 600)
+            self.dashboardWindow.setWindowTitle("Interactive DCE Kinetics Dashboard")
+            self.dashboardWindow.resize(850, 650)
             self.dashboardWindow.setStyleSheet("background-color: #2c3e50; color: white; font-family: sans-serif;")
             
             dashLayout = qt.QVBoxLayout(self.dashboardWindow)
             
-            title = qt.QLabel("Tumor ROI Analytics")
+            title = qt.QLabel("Interactive Tumor ROI Analytics")
             title.setStyleSheet("font-size: 24px; font-weight: bold; margin: 10px;")
             title.setAlignment(qt.Qt.AlignCenter)
             dashLayout.addWidget(title)
@@ -207,90 +254,89 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 QTabBar::tab:selected { background: #27ae60; font-weight: bold; }
             """)
 
-            # --- MATPLOTLIB SETUP (THE SAFE WAY) ---
-            import matplotlib
-            matplotlib.use('Agg') # Use the background rendering engine
-            from matplotlib.figure import Figure
-            from matplotlib.backends.backend_agg import FigureCanvasAgg
-            
-            # Helper: Create the dark theme
-            def create_dark_figure():
-                fig = Figure(figsize=(6, 4), dpi=100)
-                fig.patch.set_facecolor('#2c3e50')
-                ax = fig.add_subplot(111)
-                ax.set_facecolor('#34495e')
-                ax.tick_params(colors='white')
-                ax.xaxis.label.set_color('white')
-                ax.yaxis.label.set_color('white')
-                ax.title.set_color('white')
-                ax.grid(True, linestyle='--', alpha=0.5, color='#7f8c8d')
-                for spine in ax.spines.values():
-                    spine.set_edgecolor('#7f8c8d')
-                return fig, ax
+            # --- NATIVE SLICER PLOT HELPER ---
+            # This function creates a fully interactive Slicer chart
+            def create_interactive_slicer_plot(title, x_label, y_label, series_configs, data_time):
+                import vtk
+                
+                # 1. Create a data table in Slicer's memory
+                tableNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLTableNode", f"Table_{title}")
+                
+                # 2. Create the X-axis (Time) column explicitly as Float numbers
+                arrX = vtk.vtkFloatArray()
+                arrX.SetName("Time")
+                for t in data_time:
+                    arrX.InsertNextValue(float(t))
+                tableNode.AddColumn(arrX)
 
-            # Helper: Convert Matplotlib Figure to Slicer UI Image
-            def figure_to_widget(fig):
-                import io
-                
-                # 1. Save the figure to an in-memory PNG file
-                buf = io.BytesIO()
-                fig.savefig(buf, format='png', facecolor=fig.get_facecolor(), bbox_inches='tight')
-                buf.seek(0)
-                
-                # 2. Tell Slicer's Qt to load the PNG bytes directly
-                pixmap = qt.QPixmap()
-                pixmap.loadFromData(buf.getvalue())
-                
-                # 3. Put it in the UI
-                label = qt.QLabel()
-                label.setPixmap(pixmap)
-                label.setAlignment(qt.Qt.AlignCenter)
-                return label
+                # 3. Create the Chart Container
+                chartNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLPlotChartNode", f"Chart_{title}")
+                chartNode.SetTitle(title)
+                chartNode.SetXAxisTitle(x_label)
+                chartNode.SetYAxisTitle(y_label)
 
-            # TAB 1: Mean Intensity
+                # 4. Create Y-axis columns and add lines/bars
+                for config in series_configs:
+                    # Explicitly type the Y data as Floats
+                    arrY = vtk.vtkFloatArray()
+                    arrY.SetName(config["name"])
+                    for val in config["data"]:
+                        arrY.InsertNextValue(float(val))
+                    tableNode.AddColumn(arrY)
+
+                    # Create the visual line/bar
+                    seriesNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLPlotSeriesNode")
+                    seriesNode.SetAndObserveTableNodeID(tableNode.GetID())
+                    seriesNode.SetXColumnName("Time")
+                    seriesNode.SetYColumnName(config["name"])
+                    seriesNode.SetPlotType(slicer.vtkMRMLPlotSeriesNode.PlotTypeBar if config.get("type") == "Bar" else slicer.vtkMRMLPlotSeriesNode.PlotTypeScatter)
+                    seriesNode.SetMarkerStyle(slicer.vtkMRMLPlotSeriesNode.MarkerStyleCircle)
+                    
+                    # Convert 0-255 RGB to Slicer's 0.0-1.0 scale
+                    r, g, b = config["color"]
+                    seriesNode.SetColor(r/255.0, g/255.0, b/255.0)
+
+                    chartNode.AddAndObservePlotSeriesNodeID(seriesNode.GetID())
+
+                # 5. Create the Qt Widget to display the chart
+                plotWidget = slicer.qMRMLPlotWidget()
+                plotWidget.setMRMLScene(slicer.mrmlScene)
+                plotViewNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLPlotViewNode")
+                plotWidget.setMRMLPlotViewNode(plotViewNode)
+                plotViewNode.SetPlotChartNodeID(chartNode.GetID())
+                plotWidget.setMinimumHeight(350) 
+                
+                return plotWidget
+            # ---------------------------------
+
+            # TAB 1: Mean Intensity (Interactive)
             tabMean = qt.QWidget()
             layoutMean = qt.QVBoxLayout(tabMean)
-            fig1, ax1 = create_dark_figure()
-            ax1.plot(data['time'], data['mean'], marker='o', color='#2ecc71', linewidth=3, markersize=8)
-            ax1.set_title('Mean Tumor Intensity Over Time (Wash-in Curve)')
-            ax1.set_xlabel('MRI Time Sequence')
-            ax1.set_ylabel('Mean Density')
-            fig1.tight_layout()
-            layoutMean.addWidget(figure_to_widget(fig1)) # Inject the converted image
+            cfgMean = [{"name": "Mean Density", "data": data['mean'], "color": (46, 204, 113), "type": "Line"}]
+            layoutMean.addWidget(create_interactive_slicer_plot("Mean Tumor Intensity Over Time", "Time Sequence", "Density", cfgMean, data['time']))
             self.graphTabs.addTab(tabMean, "Mean Intensity")
 
-            # TAB 2: Max/Min Spread
+            # TAB 2: Max/Min Spread (Interactive)
             tabSpread = qt.QWidget()
             layoutSpread = qt.QVBoxLayout(tabSpread)
-            fig2, ax2 = create_dark_figure()
-            ax2.plot(data['time'], data['max'], marker='^', color='#e74c3c', label='Max Density', linewidth=2)
-            ax2.plot(data['time'], data['min'], marker='v', color='#3498db', label='Min Density', linewidth=2)
-            ax2.fill_between(data['time'], data['min'], data['max'], color='#95a5a6', alpha=0.2)
-            ax2.set_title('Tumor Density Range (Max vs Min)')
-            ax2.set_xlabel('MRI Time Sequence')
-            ax2.set_ylabel('Density Range')
-            ax2.legend(facecolor='#34495e', edgecolor='white', labelcolor='white')
-            fig2.tight_layout()
-            layoutSpread.addWidget(figure_to_widget(fig2)) # Inject the converted image
+            cfgSpread = [
+                {"name": "Max Density", "data": data['max'], "color": (231, 76, 60), "type": "Line"},
+                {"name": "Min Density", "data": data['min'], "color": (52, 152, 219), "type": "Line"}
+            ]
+            layoutSpread.addWidget(create_interactive_slicer_plot("Tumor Density Range", "Time Sequence", "Density", cfgSpread, data['time']))
             self.graphTabs.addTab(tabSpread, "Max / Min Range")
 
-            # TAB 3: Variance
+            # TAB 3: Variance (Interactive Bar Chart)
             tabVar = qt.QWidget()
             layoutVar = qt.QVBoxLayout(tabVar)
-            fig3, ax3 = create_dark_figure()
-            ax3.bar(data['time'], data['variance'], color='#9b59b6', width=0.4)
-            ax3.set_title('Tumor Heterogeneity (Variance) Over Time')
-            ax3.set_xlabel('MRI Time Sequence')
-            ax3.set_ylabel('Variance')
-            fig3.tight_layout()
-            layoutVar.addWidget(figure_to_widget(fig3)) # Inject the converted image
+            cfgVar = [{"name": "Variance", "data": data['variance'], "color": (155, 89, 182), "type": "Bar"}]
+            layoutVar.addWidget(create_interactive_slicer_plot("Tumor Heterogeneity", "Time Sequence", "Variance", cfgVar, data['time']))
             self.graphTabs.addTab(tabVar, "Variance")
-            
-            # TAB 4: Clinical Kinetics (The New Metrics)
+
+            # TAB 4: Clinical Kinetics (Interactive)
             tabKin = qt.QWidget()
             layoutKin = qt.QVBoxLayout(tabKin)
             
-            # 1. The Data Summary Text
             kinText = f"""
             CLINICAL KINETIC PARAMETERS:
             ------------------------------------------------
@@ -304,20 +350,21 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             lblKin.setStyleSheet("font-family: monospace; font-size: 14px; background-color: #1e1e1e; padding: 15px; border-radius: 5px;")
             layoutKin.addWidget(lblKin)
 
-            # 2. The Relative Enhancement Graph
-            fig4, ax4 = create_dark_figure()
-            ax4.plot(data['time'], data['enhancement_pct'], marker='D', color='#f1c40f', linewidth=3, markersize=8)
-            ax4.axhline(0, color='#7f8c8d', linestyle='--') # Add a zero-line
-            ax4.set_title('Relative Contrast Enhancement (%)')
-            ax4.set_xlabel('MRI Time Sequence')
-            ax4.set_ylabel('Enhancement (%)')
-            fig4.tight_layout()
-            layoutKin.addWidget(figure_to_widget(fig4))
-            
+            cfgKin = [{"name": "Enhancement (%)", "data": data['enhancement_pct'], "color": (241, 196, 15), "type": "Line"}]
+            layoutKin.addWidget(create_interactive_slicer_plot("Relative Contrast Enhancement", "Time Sequence", "Enhancement %", cfgKin, data['time']))
             self.graphTabs.addTab(tabKin, "Clinical Kinetics")
 
             # Add tabs to layout
             dashLayout.addWidget(self.graphTabs)
+
+            # --- THE NEW EXPORT BUTTON ---
+            exportBtn = qt.QPushButton("Export CSV & Mask to Patient Folder")
+            exportBtn.setStyleSheet("background-color: #2980b9; color: white; font-size: 14px; font-weight: bold; padding: 10px; margin-bottom: 5px;")
+            
+            # Pass the data array and the current folder path into the click event
+            current_folder = self.inputDirSelector.currentPath
+            exportBtn.clicked.connect(lambda: self.onExportClicked(data, current_folder))
+            dashLayout.addWidget(exportBtn)
 
             # Close Button
             closeBtn = qt.QPushButton("Close Dashboard")
@@ -329,6 +376,24 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 
         except Exception as e:
             slicer.util.errorDisplay(f"Analysis failed: {e}")
+    
+    def onExportClicked(self, data, folder_path):
+        import os
+        try:
+            # Clean the path to prevent Linux/Windows slash confusion
+            clean_path = os.path.normpath(folder_path)
+            
+            # Call the noisy logic script
+            self.logic.export_patient_data(data, clean_path)
+            
+            slicer.util.infoDisplay(
+                f"Successfully saved to:\n{clean_path}/Analysis_Results\n\nFiles generated:\n- tumor_mask.seg.nrrd\n- kinetics_report.csv", 
+                windowTitle="Export Complete"
+            )
+        except Exception as e:
+            # Force the error into the console so we can read it
+            print(f"\nEXPORT FAILED: {str(e)}\n")
+            slicer.util.errorDisplay(f"Failed to export data:\n{str(e)}")
 
 
 class DCETumorAnalyzerLogic(ScriptedLoadableModuleLogic):
@@ -438,7 +503,66 @@ class DCETumorAnalyzerLogic(ScriptedLoadableModuleLogic):
             "washout_slope": washout_slope,
             "enhancement_pct": enhancement_pct
         }
-    
+
+    def export_patient_data(self, data_dict, output_folder):
+        import slicer
+        import os
+        import csv
+
+        print(f"\n--- EXPORT PIPELINE STARTED ---")
+        print(f"Target Patient Folder: {output_folder}")
+
+        # 1. Create the subfolder safely
+        export_dir = os.path.normpath(os.path.join(output_folder, "Analysis_Results"))
+        if not os.path.exists(export_dir):
+            os.makedirs(export_dir)
+            print(f"[SUCCESS] Created directory: {export_dir}")
+        else:
+            print(f"[INFO] Directory already exists: {export_dir}")
+
+        # 2. Save the Mask
+        seg_node = slicer.mrmlScene.GetFirstNodeByName("My_Tumor_Drawings")
+        if not seg_node:
+            raise ValueError("CRITICAL ERROR: Could not find 'My_Tumor_Drawings' in memory.")
+            
+        mask_path = os.path.join(export_dir, "tumor_mask.seg.nrrd")
+        
+        # Slicer saveNode returns a boolean (True/False). We must check it!
+        save_success = slicer.util.saveNode(seg_node, mask_path)
+        if save_success:
+            print(f"[SUCCESS] Saved Mask to: {mask_path}")
+        else:
+            raise IOError(f"CRITICAL ERROR: Slicer C++ engine refused to save the mask to {mask_path}. Check folder permissions!")
+
+        # 3. Save the CSV
+        csv_path = os.path.join(export_dir, "kinetics_report.csv")
+        try:
+            with open(csv_path, mode='w', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow(["--- CLINICAL METRICS ---"])
+                writer.writerow(["Tumor Size (Voxels)", data_dict['voxel_count']])
+                writer.writerow(["Time To Peak (TTP)", data_dict['ttp']])
+                writer.writerow(["Peak Intensity", data_dict['peak']])
+                writer.writerow(["Max Wash-in Slope", data_dict['max_slope']])
+                writer.writerow(["Wash-out Slope", data_dict['washout_slope']])
+                writer.writerow(["Area Under Curve (AUC)", data_dict['auc']])
+                writer.writerow([])
+                
+                writer.writerow(["--- TIME SERIES DATA ---"])
+                writer.writerow(["Time Point", "Mean Density", "Max Density", "Min Density", "Variance", "Enhancement %"])
+                
+                for i in range(len(data_dict['time'])):
+                    writer.writerow([
+                        data_dict['time'][i], data_dict['mean'][i], data_dict['max'][i],
+                        data_dict['min'][i], data_dict['variance'][i], data_dict['enhancement_pct'][i]
+                    ])
+            print(f"[SUCCESS] Saved CSV to: {csv_path}")
+        except Exception as e:
+            raise IOError(f"CRITICAL ERROR: Python failed to write the CSV file. Details: {e}")
+
+        print("--- EXPORT PIPELINE FINISHED ---\n")
+        return True
+
 
 class DCETumorAnalyzerTest(ScriptedLoadableModuleTest):
     def setUp(self):
