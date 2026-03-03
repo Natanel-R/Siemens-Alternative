@@ -107,6 +107,11 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.loadSavedButton.clicked.connect(self.onLoadSavedButton)
         self.layout.addWidget(self.loadSavedButton)
 
+        self.clearButton = qt.QPushButton("Clear Scene & Reset")
+        self.clearButton.setStyleSheet("font-weight: bold; height: 35px; background-color: #c0392b; color: white; margin-bottom: 20px;")
+        self.clearButton.clicked.connect(self.onClearButton)
+        self.layout.addWidget(self.clearButton)
+
         # --- 4. FLAT TUMOR MARKING (Just the Tools) ---
         self.segmentEditorWidget = slicer.qMRMLSegmentEditorWidget()
         self.segmentEditorWidget.setMRMLScene(slicer.mrmlScene)
@@ -223,17 +228,53 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             
         except Exception as e:
             slicer.util.errorDisplay(f"Failed to load saved data: {e}")
+    
+    def onClearButton(self):
+        import slicer
+        
+        # 1. Ask Slicer to completely flush the C++ memory
+        slicer.mrmlScene.Clear(0)
+        
+        # 2. Reset the UI Text Box
+        self.resultsTextBox.setPlainText("Memory cleared. Ready for the next patient.")
+        
+        # 3. Disconnect the Segment Editor so it doesn't hold onto dead memory pointers
+        self.segmentEditorWidget.setMRMLScene(None)
+        self.segmentEditorWidget.setSegmentationNode(None)
+        self.segmentEditorWidget.setSourceVolumeNode(None)
+        
+        # Reconnect it to the fresh, empty scene
+        self.segmentEditorWidget.setMRMLScene(slicer.mrmlScene)
+        
+        # Clear the Python console for a fresh start
+        print("\033[H\033[J", end="") 
+        print("--- RAM FLUSHED: READY FOR NEXT PATIENT ---")
 
     def onAnalyzeButton(self):
         print("\033[H\033[J", end="")
         try:
+            # Delete old tables, charts, and series to prevent RAM leaks
+            for node in slicer.util.getNodesByClass("vtkMRMLTableNode"):
+                if node.GetName().startswith("Table_"):
+                    slicer.mrmlScene.RemoveNode(node)
+            for node in slicer.util.getNodesByClass("vtkMRMLPlotChartNode"):
+                if node.GetName().startswith("Chart_"):
+                    slicer.mrmlScene.RemoveNode(node)
+            for node in slicer.util.getNodesByClass("vtkMRMLPlotSeriesNode"):
+                slicer.mrmlScene.RemoveNode(node)
+            # --------------------------------------------
+
             self.resultsTextBox.setPlainText("Extracting 4D Time-Series Data...\nCalculating Kinetics...")
             slicer.app.processEvents() 
             
             # --- RUN THE MATH ENGINE ---
-            data = self.logic.extract_dce_series()
+            all_data = self.logic.extract_dce_series()
             
-            self.resultsTextBox.setPlainText(f"Analysis Complete!\nTumor Size: {data['voxel_count']} Voxels\nTime points analyzed: {len(data['time'])}")
+            # We assume all segments share the same timeline
+            time_data = list(all_data.values())[0]['time']
+            
+            self.resultsTextBox.setPlainText(f"Analysis Complete!\nAnalyzed {len(all_data)} discrete tumor regions.")
+            slicer.app.processEvents()
 
             # --- THE FLOATING DASHBOARD ---
             self.dashboardWindow = qt.QDialog()
@@ -254,107 +295,116 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 QTabBar::tab:selected { background: #27ae60; font-weight: bold; }
             """)
 
-            # --- NATIVE SLICER PLOT HELPER ---
-            # This function creates a fully interactive Slicer chart
+            # --- NATIVE SLICER PLOT HELPER (Strictly Typed) ---
             def create_interactive_slicer_plot(title, x_label, y_label, series_configs, data_time):
                 import vtk
-                
-                # 1. Create a data table in Slicer's memory
                 tableNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLTableNode", f"Table_{title}")
                 
-                # 2. Create the X-axis (Time) column explicitly as Float numbers
                 arrX = vtk.vtkFloatArray()
                 arrX.SetName("Time")
                 for t in data_time:
                     arrX.InsertNextValue(float(t))
                 tableNode.AddColumn(arrX)
 
-                # 3. Create the Chart Container
                 chartNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLPlotChartNode", f"Chart_{title}")
                 chartNode.SetTitle(title)
                 chartNode.SetXAxisTitle(x_label)
                 chartNode.SetYAxisTitle(y_label)
 
-                # 4. Create Y-axis columns and add lines/bars
                 for config in series_configs:
-                    # Explicitly type the Y data as Floats
                     arrY = vtk.vtkFloatArray()
                     arrY.SetName(config["name"])
                     for val in config["data"]:
                         arrY.InsertNextValue(float(val))
                     tableNode.AddColumn(arrY)
 
-                    # Create the visual line/bar
                     seriesNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLPlotSeriesNode")
+                    seriesNode.SetName(config["name"])
                     seriesNode.SetAndObserveTableNodeID(tableNode.GetID())
                     seriesNode.SetXColumnName("Time")
                     seriesNode.SetYColumnName(config["name"])
                     seriesNode.SetPlotType(slicer.vtkMRMLPlotSeriesNode.PlotTypeBar if config.get("type") == "Bar" else slicer.vtkMRMLPlotSeriesNode.PlotTypeScatter)
                     seriesNode.SetMarkerStyle(slicer.vtkMRMLPlotSeriesNode.MarkerStyleCircle)
                     
-                    # Convert 0-255 RGB to Slicer's 0.0-1.0 scale
                     r, g, b = config["color"]
                     seriesNode.SetColor(r/255.0, g/255.0, b/255.0)
-
                     chartNode.AddAndObservePlotSeriesNodeID(seriesNode.GetID())
 
-                # 5. Create the Qt Widget to display the chart
                 plotWidget = slicer.qMRMLPlotWidget()
                 plotWidget.setMRMLScene(slicer.mrmlScene)
                 plotViewNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLPlotViewNode")
                 plotWidget.setMRMLPlotViewNode(plotViewNode)
                 plotViewNode.SetPlotChartNodeID(chartNode.GetID())
                 plotWidget.setMinimumHeight(350) 
-                
                 return plotWidget
-            # ---------------------------------
 
-            # TAB 1: Mean Intensity (Interactive)
+            # --- DYNAMIC MULTI-LAYER GRAPH CONFIGURATION ---
+            color_palette = [
+                (46, 204, 113),  # Emerald Green
+                (241, 196, 15),  # Sunflower Yellow
+                (52, 152, 219),  # Peter River Blue
+                (155, 89, 182),  # Amethyst Purple
+                (231, 76, 60)    # Alizarin Red
+            ]
+
+            cfgMean, cfgSpread, cfgVar, cfgKin = [], [], [], []
+            kinText = "CLINICAL KINETIC PARAMETERS:\n" + "="*48 + "\n"
+
+            for idx, (seg_name, data) in enumerate(all_data.items()):
+                # Pick a color from the palette based on the loop index
+                c = color_palette[idx % len(color_palette)]
+                dark_c = (max(0, c[0]-80), max(0, c[1]-80), max(0, c[2]-80)) # Darker shade for Min line
+
+                # Compile data for all 4 tabs dynamically
+                cfgMean.append({"name": f"{seg_name}", "data": data['mean'], "color": c, "type": "Line"})
+                cfgSpread.append({"name": f"{seg_name} Max", "data": data['max'], "color": c, "type": "Line"})
+                cfgSpread.append({"name": f"{seg_name} Min", "data": data['min'], "color": dark_c, "type": "Line"})
+                cfgVar.append({"name": f"{seg_name}", "data": data['variance'], "color": c, "type": "Line"}) # Changed to line so bars don't overlap
+                cfgKin.append({"name": f"{seg_name}", "data": data['enhancement_pct'], "color": c, "type": "Line"})
+                
+                kinText += f"""[{seg_name}]
+                Tumor Size:               {data['voxel_count']} Voxels
+                Time To Peak (TTP):       {data['ttp']}
+                Peak Intensity:           {data['peak']} 
+                Max Wash-in Slope:        +{data['max_slope']}
+                Wash-out Slope:           {data['washout_slope']}
+                Area Under Curve (AUC):   {data['auc']}
+                {"-"*48}\n"""
+
+            # TAB 1: Mean Intensity
             tabMean = qt.QWidget()
             layoutMean = qt.QVBoxLayout(tabMean)
-            cfgMean = [{"name": "Mean Density", "data": data['mean'], "color": (46, 204, 113), "type": "Line"}]
-            layoutMean.addWidget(create_interactive_slicer_plot("Mean Tumor Intensity Over Time", "Time Sequence", "Density", cfgMean, data['time']))
+            layoutMean.addWidget(create_interactive_slicer_plot("Mean Tumor Intensity Over Time", "Time Sequence", "Density", cfgMean, time_data))
             self.graphTabs.addTab(tabMean, "Mean Intensity")
 
-            # TAB 2: Max/Min Spread (Interactive)
+            # TAB 2: Max/Min Spread
             tabSpread = qt.QWidget()
             layoutSpread = qt.QVBoxLayout(tabSpread)
-            cfgSpread = [
-                {"name": "Max Density", "data": data['max'], "color": (231, 76, 60), "type": "Line"},
-                {"name": "Min Density", "data": data['min'], "color": (52, 152, 219), "type": "Line"}
-            ]
-            layoutSpread.addWidget(create_interactive_slicer_plot("Tumor Density Range", "Time Sequence", "Density", cfgSpread, data['time']))
+            layoutSpread.addWidget(create_interactive_slicer_plot("Tumor Density Range", "Time Sequence", "Density", cfgSpread, time_data))
             self.graphTabs.addTab(tabSpread, "Max / Min Range")
 
-            # TAB 3: Variance (Interactive Bar Chart)
+            # TAB 3: Variance
             tabVar = qt.QWidget()
             layoutVar = qt.QVBoxLayout(tabVar)
-            cfgVar = [{"name": "Variance", "data": data['variance'], "color": (155, 89, 182), "type": "Bar"}]
-            layoutVar.addWidget(create_interactive_slicer_plot("Tumor Heterogeneity", "Time Sequence", "Variance", cfgVar, data['time']))
+            layoutVar.addWidget(create_interactive_slicer_plot("Tumor Heterogeneity", "Time Sequence", "Variance", cfgVar, time_data))
             self.graphTabs.addTab(tabVar, "Variance")
 
-            # TAB 4: Clinical Kinetics (Interactive)
+            # TAB 4: Clinical Kinetics Text & Graph
             tabKin = qt.QWidget()
             layoutKin = qt.QVBoxLayout(tabKin)
             
-            kinText = f"""
-            CLINICAL KINETIC PARAMETERS:
-            ------------------------------------------------
-            Time To Peak (TTP):       {data['ttp']} (Time Unit)
-            Peak Intensity:           {data['peak']} 
-            Max Wash-in Slope:        +{data['max_slope']} / unit
-            Wash-out Slope:           {data['washout_slope']} / unit
-            Area Under Curve (AUC):   {data['auc']}
-            """
+            # Make the text scrollable so it doesn't break the UI if you draw 10 segments
+            scrollArea = qt.QScrollArea()
             lblKin = qt.QLabel(kinText)
             lblKin.setStyleSheet("font-family: monospace; font-size: 14px; background-color: #1e1e1e; padding: 15px; border-radius: 5px;")
-            layoutKin.addWidget(lblKin)
+            scrollArea.setWidget(lblKin)
+            scrollArea.setWidgetResizable(True)
+            scrollArea.setMaximumHeight(180) 
+            layoutKin.addWidget(scrollArea)
 
-            cfgKin = [{"name": "Enhancement (%)", "data": data['enhancement_pct'], "color": (241, 196, 15), "type": "Line"}]
-            layoutKin.addWidget(create_interactive_slicer_plot("Relative Contrast Enhancement", "Time Sequence", "Enhancement %", cfgKin, data['time']))
+            layoutKin.addWidget(create_interactive_slicer_plot("Relative Contrast Enhancement", "Time Sequence", "Enhancement %", cfgKin, time_data))
             self.graphTabs.addTab(tabKin, "Clinical Kinetics")
 
-            # Add tabs to layout
             dashLayout.addWidget(self.graphTabs)
 
             # --- THE NEW EXPORT BUTTON ---
@@ -363,7 +413,7 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             
             # Pass the data array and the current folder path into the click event
             current_folder = self.inputDirSelector.currentPath
-            exportBtn.clicked.connect(lambda: self.onExportClicked(data, current_folder))
+            exportBtn.clicked.connect(lambda: self.onExportClicked(all_data, current_folder))
             dashLayout.addWidget(exportBtn)
 
             # Close Button
@@ -387,7 +437,7 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.logic.export_patient_data(data, clean_path)
             
             slicer.util.infoDisplay(
-                f"Successfully saved to:\n{clean_path}/Analysis_Results\n\nFiles generated:\n- tumor_mask.seg.nrrd\n- kinetics_report.csv", 
+                f"Successfully saved to:\n{clean_path}/Analysis_Results\n\nFiles generated:\n- tumor_mask.seg.nrrd\n- tumor_mask.nii.gz\n- kinetics_report.csv", 
                 windowTitle="Export Complete"
             )
         except Exception as e:
@@ -421,6 +471,7 @@ class DCETumorAnalyzerLogic(ScriptedLoadableModuleLogic):
 
     def extract_dce_series(self):
         import slicer
+        import vtk
         import numpy as np
 
         seg_node = slicer.mrmlScene.GetFirstNodeByName("My_Tumor_Drawings")
@@ -439,123 +490,135 @@ class DCETumorAnalyzerLogic(ScriptedLoadableModuleLogic):
 
         mri_volumes.sort(key=lambda n: n.GetName())
 
-        reference_volume = mri_volumes[0]
-        labelmap_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode")
-        slicer.modules.segmentations.logic().ExportVisibleSegmentsToLabelmapNode(seg_node, labelmap_node, reference_volume)
+        # --- THE NEW MULTI-LAYER LOGIC ---
+        segmentation = seg_node.GetSegmentation()
+        segmentIDs = vtk.vtkStringArray()
+        segmentation.GetSegmentIDs(segmentIDs)
         
-        mask_array = slicer.util.arrayFromVolume(labelmap_node)
-
-        time_points = []
-        means = []
-        maxs = []
-        mins = []
-        variances = []
-
-        for idx, volume in enumerate(mri_volumes):
-            vol_array = slicer.util.arrayFromVolume(volume)
-            tumor_pixels = vol_array[mask_array > 0]
+        multi_roi_data = {} # Our new master dictionary
+        
+        for i in range(segmentIDs.GetNumberOfValues()):
+            seg_id = segmentIDs.GetValue(i)
+            seg_name = segmentation.GetSegment(seg_id).GetName()
             
-            if len(tumor_pixels) > 0:
-                time_points.append(idx)
-                means.append(round(float(tumor_pixels.mean()), 2))
-                maxs.append(float(tumor_pixels.max()))
-                mins.append(float(tumor_pixels.min()))
-                variances.append(round(float(np.var(tumor_pixels)), 2))
+            # Extract the binary 1s and 0s specifically for THIS layer only
+            mask_array = slicer.util.arrayFromSegmentBinaryLabelmap(seg_node, seg_id, mri_volumes[0])
+            
+            time_points = []
+            means, maxs, mins, variances = [], [], [], []
+            
+            for idx, volume in enumerate(mri_volumes):
+                slicer.app.processEvents()
+                vol_array = slicer.util.arrayFromVolume(volume)
+                tumor_pixels = vol_array[mask_array > 0]
+                
+                if len(tumor_pixels) > 0:
+                    time_points.append(idx)
+                    means.append(round(float(tumor_pixels.mean()), 2))
+                    maxs.append(float(tumor_pixels.max()))
+                    mins.append(float(tumor_pixels.min()))
+                    variances.append(round(float(np.var(tumor_pixels)), 2))
 
-        slicer.mrmlScene.RemoveNode(labelmap_node)
-
-        # --- NEW KINETIC MATH (The Clinical Metrics) ---
-        baseline = means[0] if len(means) > 0 else 0
-        peak_intensity = max(means) if len(means) > 0 else 0
-        ttp_idx = means.index(peak_intensity) if len(means) > 0 else 0
-        ttp = time_points[ttp_idx] if len(time_points) > 0 else 0
-        
-        # 1. AUC (Area Under the Curve) via Trapezoidal Integration
-        auc = round(float(np.trapz(means, time_points)), 2) if len(time_points) > 1 else 0
-
-        # 2. Max Slope (Wash-in Rate)
-        slopes = np.diff(means) / np.diff(time_points) if len(time_points) > 1 else [0]
-        max_slope = round(float(max(slopes)), 2) if len(slopes) > 0 else 0
-        
-        # 3. Wash-out Slope (From Peak to End)
-        if ttp_idx < len(means) - 1 and len(time_points) > 1:
-            washout_slope = (means[-1] - peak_intensity) / (time_points[-1] - time_points[ttp_idx])
-        else:
+            # Kinetics math for THIS layer
+            baseline = means[0] if len(means) > 0 else 0
+            peak_intensity = max(means) if len(means) > 0 else 0
+            ttp_idx = means.index(peak_intensity) if len(means) > 0 else 0
+            ttp = time_points[ttp_idx] if len(time_points) > 0 else 0
+            auc = round(float(np.trapz(means, time_points)), 2) if len(time_points) > 1 else 0
+            
+            slopes = np.diff(means) / np.diff(time_points) if len(time_points) > 1 else [0]
+            max_slope = round(float(max(slopes)), 2) if len(slopes) > 0 else 0
+            
             washout_slope = 0
-        washout_slope = round(float(washout_slope), 2)
-        
-        # 4. Relative Enhancement Percentage
-        enhancement_pct = [round(((m - baseline) / baseline) * 100, 2) if baseline > 0 else 0 for m in means]
-        # -----------------------------------------------
+            if ttp_idx < len(means) - 1 and len(time_points) > 1:
+                washout_slope = (means[-1] - peak_intensity) / (time_points[-1] - time_points[ttp_idx])
+            washout_slope = round(float(washout_slope), 2)
+            
+            enhancement_pct = [round(((m - baseline) / baseline) * 100, 2) if baseline > 0 else 0 for m in means]
 
-        return {
-            "time": time_points,
-            "mean": means,
-            "max": maxs,
-            "min": mins,
-            "variance": variances,
-            "voxel_count": len(tumor_pixels) if len(mri_volumes) > 0 else 0,
-            "baseline": baseline,
-            "peak": peak_intensity,
-            "ttp": ttp,
-            "auc": auc,
-            "max_slope": max_slope,
-            "washout_slope": washout_slope,
-            "enhancement_pct": enhancement_pct
-        }
+            # Save this layer's data into the master dictionary keyed by its name
+            multi_roi_data[seg_name] = {
+                "time": time_points,
+                "mean": means,
+                "max": maxs,
+                "min": mins,
+                "variance": variances,
+                "voxel_count": len(tumor_pixels) if len(mri_volumes) > 0 else 0,
+                "baseline": baseline,
+                "peak": peak_intensity,
+                "ttp": ttp,
+                "auc": auc,
+                "max_slope": max_slope,
+                "washout_slope": washout_slope,
+                "enhancement_pct": enhancement_pct
+            }
 
-    def export_patient_data(self, data_dict, output_folder):
+        return multi_roi_data
+
+    def export_patient_data(self, multi_roi_data, output_folder):
         import slicer
         import os
         import csv
 
         print(f"\n--- EXPORT PIPELINE STARTED ---")
-        print(f"Target Patient Folder: {output_folder}")
-
-        # 1. Create the subfolder safely
         export_dir = os.path.normpath(os.path.join(output_folder, "Analysis_Results"))
         if not os.path.exists(export_dir):
             os.makedirs(export_dir)
-            print(f"[SUCCESS] Created directory: {export_dir}")
-        else:
-            print(f"[INFO] Directory already exists: {export_dir}")
 
-        # 2. Save the Mask
         seg_node = slicer.mrmlScene.GetFirstNodeByName("My_Tumor_Drawings")
         if not seg_node:
             raise ValueError("CRITICAL ERROR: Could not find 'My_Tumor_Drawings' in memory.")
             
         mask_path = os.path.join(export_dir, "tumor_mask.seg.nrrd")
-        
-        # Slicer saveNode returns a boolean (True/False). We must check it!
         save_success = slicer.util.saveNode(seg_node, mask_path)
-        if save_success:
-            print(f"[SUCCESS] Saved Mask to: {mask_path}")
-        else:
-            raise IOError(f"CRITICAL ERROR: Slicer C++ engine refused to save the mask to {mask_path}. Check folder permissions!")
+        if not save_success:
+            raise IOError(f"CRITICAL ERROR: Slicer C++ engine refused to save the mask.")
 
-        # 3. Save the CSV
+        labelmap_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode")
+        reference_volume = None
+        for node in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"):
+            name = node.GetName().lower()
+            if "mask" not in name and "drawing" not in name:
+                reference_volume = node
+                break
+                
+        if reference_volume:
+            slicer.modules.segmentations.logic().ExportVisibleSegmentsToLabelmapNode(seg_node, labelmap_node, reference_volume)
+            nifti_path = os.path.join(export_dir, "tumor_mask.nii.gz")
+            slicer.util.saveNode(labelmap_node, nifti_path)
+            slicer.mrmlScene.RemoveNode(labelmap_node) # Clean up memory so Slicer doesn't slow down
+            print(f"[SUCCESS] Saved NIfTI to: {nifti_path}")
+        else:
+            print("[WARNING] Could not find reference volume. NIfTI not saved.")
+
+
         csv_path = os.path.join(export_dir, "kinetics_report.csv")
         try:
             with open(csv_path, mode='w', newline='') as file:
                 writer = csv.writer(file)
-                writer.writerow(["--- CLINICAL METRICS ---"])
-                writer.writerow(["Tumor Size (Voxels)", data_dict['voxel_count']])
-                writer.writerow(["Time To Peak (TTP)", data_dict['ttp']])
-                writer.writerow(["Peak Intensity", data_dict['peak']])
-                writer.writerow(["Max Wash-in Slope", data_dict['max_slope']])
-                writer.writerow(["Wash-out Slope", data_dict['washout_slope']])
-                writer.writerow(["Area Under Curve (AUC)", data_dict['auc']])
-                writer.writerow([])
                 
-                writer.writerow(["--- TIME SERIES DATA ---"])
-                writer.writerow(["Time Point", "Mean Density", "Max Density", "Min Density", "Variance", "Enhancement %"])
-                
-                for i in range(len(data_dict['time'])):
-                    writer.writerow([
-                        data_dict['time'][i], data_dict['mean'][i], data_dict['max'][i],
-                        data_dict['min'][i], data_dict['variance'][i], data_dict['enhancement_pct'][i]
-                    ])
+                # --- NEW: Loop through every drawn layer! ---
+                for seg_name, data_dict in multi_roi_data.items():
+                    writer.writerow([f"=== SEGMENT: {seg_name} ==="])
+                    writer.writerow(["--- CLINICAL METRICS ---"])
+                    writer.writerow(["Tumor Size (Voxels)", data_dict['voxel_count']])
+                    writer.writerow(["Time To Peak (TTP)", data_dict['ttp']])
+                    writer.writerow(["Peak Intensity", data_dict['peak']])
+                    writer.writerow(["Max Wash-in Slope", data_dict['max_slope']])
+                    writer.writerow(["Wash-out Slope", data_dict['washout_slope']])
+                    writer.writerow(["Area Under Curve (AUC)", data_dict['auc']])
+                    writer.writerow([])
+                    
+                    writer.writerow(["--- TIME SERIES DATA ---"])
+                    writer.writerow(["Time Point", "Mean Density", "Max Density", "Min Density", "Variance", "Enhancement %"])
+                    
+                    for i in range(len(data_dict['time'])):
+                        writer.writerow([
+                            data_dict['time'][i], data_dict['mean'][i], data_dict['max'][i],
+                            data_dict['min'][i], data_dict['variance'][i], data_dict['enhancement_pct'][i]
+                        ])
+                    writer.writerow([]) # Blank line between segments
+                # --------------------------------------------
             print(f"[SUCCESS] Saved CSV to: {csv_path}")
         except Exception as e:
             raise IOError(f"CRITICAL ERROR: Python failed to write the CSV file. Details: {e}")
