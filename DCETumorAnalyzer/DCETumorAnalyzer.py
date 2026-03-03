@@ -84,6 +84,21 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         except Exception as e:
             print(f"Could not hide global widgets: {e}")
 
+        # --- NEW: PATIENT IDENTITY HEADER ---
+        self.patientBox = qt.QGroupBox("Active Patient Identity")
+        self.patientBox.setStyleSheet("font-weight: bold; color: #3498db; border: 1px solid #3498db; border-radius: 5px; padding: 10px;")
+        patientLayout = qt.QFormLayout(self.patientBox)
+        
+        self.patientNameLabel = qt.QLabel("None")
+        self.patientIDLabel = qt.QLabel("None")
+        self.studyDateLabel = qt.QLabel("None")
+        
+        patientLayout.addRow("Name: ", self.patientNameLabel)
+        patientLayout.addRow("ID:   ", self.patientIDLabel)
+        patientLayout.addRow("Date: ", self.studyDateLabel)
+        
+        self.layout.addWidget(self.patientBox)
+
         # --- 2. FLAT RELOAD BUTTON ---
         self.reloadButton = qt.QPushButton("Reload Script")
         self.reloadButton.setStyleSheet("background-color: #555555; color: white; margin-bottom: 15px; height: 30px;")
@@ -160,6 +175,23 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             # Wipe memory and load data
             slicer.mrmlScene.Clear()
             self.logic.load_dce_data(path)
+
+            first_vol = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
+        
+            if first_vol:
+                # Slicer stores DICOM tags in the 'Attribute' dictionary
+                p_name = first_vol.GetAttribute("DICOM.PatientName") if first_vol.GetAttribute("DICOM.PatientName") else "Anonymous"
+                p_id = first_vol.GetAttribute("DICOM.PatientID") if first_vol.GetAttribute("DICOM.PatientID") else "Unknown"
+                p_date = first_vol.GetAttribute("DICOM.StudyDate") if first_vol.GetAttribute("DICOM.StudyDate") else "N/A"
+                
+                # Format the date (DICOM date is YYYYMMDD)
+                if p_date != "N/A" and len(p_date) == 8:
+                    p_date = f"{p_date[6:8]}/{p_date[4:6]}/{p_date[0:4]}"
+
+                # Update the UI Labels
+                self.patientNameLabel.setText(p_name)
+                self.patientIDLabel.setText(p_id)
+                self.studyDateLabel.setText(p_date)
             slicer.app.processEvents()
             
             mri_node = slicer.mrmlScene.GetFirstNodeByName("10: B0")
@@ -242,7 +274,9 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.segmentEditorWidget.setMRMLScene(None)
         self.segmentEditorWidget.setSegmentationNode(None)
         self.segmentEditorWidget.setSourceVolumeNode(None)
-        
+        self.patientNameLabel.setText("None")
+        self.patientIDLabel.setText("None")
+        self.studyDateLabel.setText("None")
         # Reconnect it to the fresh, empty scene
         self.segmentEditorWidget.setMRMLScene(slicer.mrmlScene)
         
@@ -279,7 +313,7 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             # --- THE FLOATING DASHBOARD ---
             self.dashboardWindow = qt.QDialog()
             self.dashboardWindow.setWindowTitle("Interactive DCE Kinetics Dashboard")
-            self.dashboardWindow.resize(850, 650)
+            self.dashboardWindow.resize(1100, 650)
             self.dashboardWindow.setStyleSheet("background-color: #2c3e50; color: white; font-family: sans-serif;")
             
             dashLayout = qt.QVBoxLayout(self.dashboardWindow)
@@ -362,14 +396,14 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 cfgVar.append({"name": f"{seg_name}", "data": data['variance'], "color": c, "type": "Line"}) # Changed to line so bars don't overlap
                 cfgKin.append({"name": f"{seg_name}", "data": data['enhancement_pct'], "color": c, "type": "Line"})
                 
-                kinText += f"""[{seg_name}]
-                Tumor Size:               {data['voxel_count']} Voxels
-                Time To Peak (TTP):       {data['ttp']}
-                Peak Intensity:           {data['peak']} 
-                Max Wash-in Slope:        +{data['max_slope']}
-                Wash-out Slope:           {data['washout_slope']}
-                Area Under Curve (AUC):   {data['auc']}
-                {"-"*48}\n"""
+                kinText += f"REGION: {seg_name}\n"
+                kinText += f"Size:       {data['voxel_count']} px\n"
+                kinText += f"TTP:        {data['ttp']}\n"
+                kinText += f"Peak:       {data['peak']}\n" 
+                kinText += f"Wash-in:    +{data['max_slope']}\n"
+                kinText += f"Wash-out:   {data['washout_slope']}\n"
+                kinText += f"AUC:        {data['auc']}\n"
+                kinText += f"{'-'*30}\n" # Shorter separator
 
             # TAB 1: Mean Intensity
             tabMean = qt.QWidget()
@@ -391,18 +425,35 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             # TAB 4: Clinical Kinetics Text & Graph
             tabKin = qt.QWidget()
-            layoutKin = qt.QVBoxLayout(tabKin)
-            
-            # Make the text scrollable so it doesn't break the UI if you draw 10 segments
+            layoutKin = qt.QHBoxLayout(tabKin) # Changed to Horizontal!
+
+            # 1. Left Side: Scrollable Text Metrics
             scrollArea = qt.QScrollArea()
             lblKin = qt.QLabel(kinText)
-            lblKin.setStyleSheet("font-family: monospace; font-size: 14px; background-color: #1e1e1e; padding: 15px; border-radius: 5px;")
+            lblKin.setStyleSheet("""
+                font-family: 'Courier New', monospace; 
+                font-size: 13px; 
+                background-color: #1a1a1a; 
+                color: #2ecc71; 
+                padding: 15px; 
+                border: 1px solid #27ae60;
+            """)
+            lblKin.setAlignment(qt.Qt.AlignTop | qt.Qt.AlignLeft)
             scrollArea.setWidget(lblKin)
             scrollArea.setWidgetResizable(True)
-            scrollArea.setMaximumHeight(180) 
+            scrollArea.setFixedWidth(250) # Give the text a fixed professional width
             layoutKin.addWidget(scrollArea)
 
-            layoutKin.addWidget(create_interactive_slicer_plot("Relative Contrast Enhancement", "Time Sequence", "Enhancement %", cfgKin, time_data))
+            # 2. Right Side: Enhancement Graph
+            graphWidget = create_interactive_slicer_plot(
+                "Relative Contrast Enhancement", 
+                "Time Sequence", 
+                "Enhancement %", 
+                cfgKin, 
+                time_data
+            )
+            layoutKin.addWidget(graphWidget)
+
             self.graphTabs.addTab(tabKin, "Clinical Kinetics")
 
             dashLayout.addWidget(self.graphTabs)
@@ -423,6 +474,9 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             dashLayout.addWidget(closeBtn)
 
             self.dashboardWindow.show()
+
+            import gc
+            gc.collect()
                 
         except Exception as e:
             slicer.util.errorDisplay(f"Analysis failed: {e}")
