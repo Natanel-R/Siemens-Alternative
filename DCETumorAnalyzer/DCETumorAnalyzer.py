@@ -163,6 +163,31 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def onReload(self):
         print("\n--- Reloading Module ---")
         slicer.util.reloadScriptedModule("DCETumorAnalyzer")
+    
+    def onCopyClicked(self, text, button):
+        import qt
+        import slicer
+        
+        # 1. Perform the actual Copy
+        clipboard = qt.QApplication.clipboard()
+        clipboard.setText(text)
+        
+        # 2. Provide Visual Feedback
+        old_text = button.text
+        old_style = button.styleSheet
+        
+        button.setText("Results Copied!")
+        button.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; height: 25px; border-radius: 4px;")
+        
+        # 3. Show status message in Slicer's bottom bar
+        slicer.util.showStatusMessage("Kinetics data copied to clipboard!", 3000)
+        
+        # 4. Reset the button after 1.5 seconds using a Timer
+        qt.QTimer.singleShot(300, lambda: self.resetCopyButton(button, old_text, old_style))
+
+    def resetCopyButton(self, button, text, style):
+        button.setText(text)
+        button.setStyleSheet(style)
 
     def onProcessButton(self):
         print("\033[H\033[J", end="") 
@@ -425,9 +450,33 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             # TAB 4: Clinical Kinetics Text & Graph
             tabKin = qt.QWidget()
-            layoutKin = qt.QHBoxLayout(tabKin) # Changed to Horizontal!
+            masterLayout = qt.QVBoxLayout(tabKin) # Master Vertical Container
 
-            # 1. Left Side: Scrollable Text Metrics
+            # 1. TOP BAR: The Copy Button
+            topBar = qt.QHBoxLayout()
+            copyBtn = qt.QPushButton("Copy Results to Clipboard")
+            copyBtn.setStyleSheet("""
+                background-color: #34495e; 
+                color: white; 
+                font-weight: bold; 
+                height: 25px; 
+                padding: 5px 15px;
+                border-radius: 4px;
+            """)
+            copyBtn.setFixedWidth(220)
+
+            copyBtn.clicked.connect(lambda: self.onCopyClicked(kinText, copyBtn))
+            topBar.addWidget(copyBtn)
+            topBar.addStretch() # Pushes button to the far left
+            masterLayout.addLayout(topBar)
+
+            mainSplitter = qt.QSplitter(qt.Qt.Horizontal)
+            mainSplitter.setStyleSheet("QSplitter::handle { background-color: #444; width: 4px; }")
+
+            # 2. DATA AREA: Horizontal Side-by-Side (Text & Graph)
+            dataAreaLayout = qt.QHBoxLayout()
+            
+            # Left Side: The Black Text Box
             scrollArea = qt.QScrollArea()
             lblKin = qt.QLabel(kinText)
             lblKin.setStyleSheet("""
@@ -441,10 +490,10 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             lblKin.setAlignment(qt.Qt.AlignTop | qt.Qt.AlignLeft)
             scrollArea.setWidget(lblKin)
             scrollArea.setWidgetResizable(True)
-            scrollArea.setFixedWidth(250) # Give the text a fixed professional width
-            layoutKin.addWidget(scrollArea)
+            scrollArea.setMinimumWidth(100)
+            mainSplitter.addWidget(scrollArea)
 
-            # 2. Right Side: Enhancement Graph
+            # Right Side: The Graph
             graphWidget = create_interactive_slicer_plot(
                 "Relative Contrast Enhancement", 
                 "Time Sequence", 
@@ -452,8 +501,9 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 cfgKin, 
                 time_data
             )
-            layoutKin.addWidget(graphWidget)
-
+            mainSplitter.addWidget(graphWidget)
+            mainSplitter.setSizes([350, 750])
+            masterLayout.addWidget(mainSplitter)
             self.graphTabs.addTab(tabKin, "Clinical Kinetics")
 
             dashLayout.addWidget(self.graphTabs)
