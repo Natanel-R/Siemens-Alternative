@@ -328,7 +328,7 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             
             # --- RUN THE MATH ENGINE ---
             all_data = self.logic.extract_dce_series()
-            
+
             # We assume all segments share the same timeline
             time_data = list(all_data.values())[0]['time']
             
@@ -359,6 +359,7 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 import vtk
                 tableNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLTableNode", f"Table_{title}")
                 
+                tableModifyId = tableNode.StartModify()
                 arrX = vtk.vtkFloatArray()
                 arrX.SetName("Time")
                 for t in data_time:
@@ -388,7 +389,8 @@ class DCETumorAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     r, g, b = config["color"]
                     seriesNode.SetColor(r/255.0, g/255.0, b/255.0)
                     chartNode.AddAndObservePlotSeriesNodeID(seriesNode.GetID())
-
+                
+                tableNode.EndModify(tableModifyId)
                 plotWidget = slicer.qMRMLPlotWidget()
                 plotWidget.setMRMLScene(slicer.mrmlScene)
                 plotViewNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLPlotViewNode")
@@ -594,7 +596,7 @@ class DCETumorAnalyzerLogic(ScriptedLoadableModuleLogic):
 
         mri_volumes.sort(key=lambda n: n.GetName())
 
-        # --- THE NEW MULTI-LAYER LOGIC ---
+        # --- MULTI-LAYER LOGIC ---
         segmentation = seg_node.GetSegmentation()
         segmentIDs = vtk.vtkStringArray()
         segmentation.GetSegmentIDs(segmentIDs)
